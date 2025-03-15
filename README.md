@@ -11,7 +11,7 @@ A Python-based MCP server providing tools to access and interact with the [polic
 
 ## Prerequisites
 
-- Python 3.6+
+- Python 3.11+
 - Required packages: `mcp`, `requests`
 
 ## Installation
