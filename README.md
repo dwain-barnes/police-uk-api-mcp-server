@@ -54,7 +54,7 @@ To contribute or run locally:
 
 ```bash
 # Clone the repository
-git clone https://github.com/dwain-barnes/mcp-server-police-uk.git
+git clone https://github.com/dwain-barnes/police-uk-api-mcp-server.git
 cd mcp-server-police-uk
 
 # Install dependencies
