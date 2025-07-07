@@ -42,7 +42,7 @@ Add to your Claude Desktop configuration file:
   "mcpServers": {
     "police-uk": {
       "command": "npx",
-      "args": ["mcp-server-police-uk"]
+      "args": ["-y", "mcp-server-police-uk"]
     }
   }
 }
