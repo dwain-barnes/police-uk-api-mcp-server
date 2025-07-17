@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/dwain-barnes-police-uk-api-mcp-server-badge.png)](https://mseep.ai/app/dwain-barnes-police-uk-api-mcp-server)
+
 # police-uk-api-mcp-server
 
 A Python-based MCP server providing tools to access and interact with the [police.uk API](https://data.police.uk/), offering data on crimes, police forces, neighbourhoods, and stop-and-search incidents.
