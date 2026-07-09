@@ -36,10 +36,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dwainbarnes/police-uk-api-mcp-server.git"
+    "url": "git+https://github.com/dwain-barnes/police-uk-api-mcp-server.git"
   },
   "bugs": {
-    "url": "https://github.com/dwainbarnes/police-uk-api-mcp-server/issues"
+    "url": "https://github.com/dwain-barnes/police-uk-api-mcp-server/issues"
   },
-  "homepage": "https://github.com/dwainbarnes/police-uk-api-mcp-server#readme"
+  "homepage": "https://github.com/dwain-barnes/police-uk-api-mcp-server#readme"
 }
