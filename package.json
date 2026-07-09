@@ -1,6 +1,6 @@
 {
   "name": "mcp-server-police-uk",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "MCP server for police.uk API - access UK crime data, police forces, neighbourhoods, and stop-and-search incidents",
   "main": "dist/index.js",
   "type": "module",
@@ -24,8 +24,8 @@
   "author": "Dwain Barnes",
   "license": "MIT",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^0.4.0",
-    "axios": "^1.6.0"
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.23.8"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
@@ -36,10 +36,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yourusername/mcp-server-police-uk.git"
+    "url": "git+https://github.com/dwainbarnes/police-uk-api-mcp-server.git"
   },
   "bugs": {
-    "url": "https://github.com/yourusername/mcp-server-police-uk/issues"
+    "url": "https://github.com/dwainbarnes/police-uk-api-mcp-server/issues"
   },
-  "homepage": "https://github.com/yourusername/mcp-server-police-uk#readme"
+  "homepage": "https://github.com/dwainbarnes/police-uk-api-mcp-server#readme"
 }

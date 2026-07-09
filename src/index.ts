@@ -1,523 +1,492 @@
 #!/usr/bin/env node
 
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import axios from 'axios';
+import { z } from 'zod';
 
-// Helper function to make API requests to police.uk
-async function makeApiRequest(endpoint: string, params?: Record<string, any>) {
-  const baseUrl = 'https://data.police.uk/api';
-  const url = `${baseUrl}/${endpoint}`;
-  
+const BASE_URL = 'https://data.police.uk/api';
+const REQUEST_TIMEOUT_MS = 15_000;
+
+/**
+ * Perform a GET request against the police.uk API.
+ *
+ * `path` MUST already contain only trusted, URL-encoded segments (see the
+ * `enc()` helper and the zod validation on each tool). On any non-2xx
+ * response or network/timeout error this throws an Error with an
+ * actionable message, so the calling tool handler surfaces `isError: true`.
+ */
+async function makeApiRequest(
+  path: string,
+  query?: Record<string, string | number | undefined>
+): Promise<unknown> {
+  const url = new URL(`${BASE_URL}/${path}`);
+  if (query) {
+    for (const [key, value] of Object.entries(query)) {
+      if (value !== undefined) {
+        url.searchParams.set(key, String(value));
+      }
+    }
+  }
+
+  let response: Response;
   try {
-    const response = await axios.get(url, { params, timeout: 10000 });
-    return response.data;
+    response = await fetch(url, {
+      headers: { Accept: 'application/json' },
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
   } catch (error) {
-    console.error(`API request failed: ${error}`);
-    return null;
+    if (error instanceof Error && error.name === 'TimeoutError') {
+      throw new Error(
+        `Request to the police.uk API timed out after ${REQUEST_TIMEOUT_MS / 1000}s (${url.pathname}). ` +
+          `Try a smaller area or a specific month (date=YYYY-MM).`
+      );
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Network error contacting the police.uk API (${url.pathname}): ${message}`);
   }
-}
 
-// Define tool schemas
-const tools = [
-  {
-    name: 'get_street_level_crimes',
-    description: 'Retrieve street-level crimes by lat/lng or custom polygon area',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        lat: { type: 'number', description: 'Latitude of the requested crime area' },
-        lng: { type: 'number', description: 'Longitude of the requested crime area' },
-        poly: { type: 'string', description: 'The lat/lng pairs defining the boundary of the custom area' },
-        date: { type: 'string', description: 'Limit results to a specific month (YYYY-MM)' },
-        category: { type: 'string', description: 'The crime category', default: 'all-crime' }
+  if (!response.ok) {
+    switch (response.status) {
+      case 404:
+        throw new Error(
+          `No data found (HTTP 404). The police.uk API returns 404 when there are no results for the given ` +
+            `parameters (for example no crimes/outcomes for that location or month), or when an id does not exist. ` +
+            `Check the id and try a different date (YYYY-MM).`
+        );
+      case 429:
+        throw new Error(
+          `Rate limited (HTTP 429). Too many requests to the police.uk API. Wait a moment and retry.`
+        );
+      case 503:
+        throw new Error(
+          `Area too large (HTTP 503). The police.uk API refuses requests whose custom area or point contains more ` +
+            `than 10,000 results. Use a smaller polygon/radius or narrow the request with a specific month (date=YYYY-MM).`
+        );
+      default: {
+        let body = '';
+        try {
+          body = (await response.text()).slice(0, 300);
+        } catch {
+          /* ignore body read errors */
+        }
+        throw new Error(
+          `The police.uk API returned HTTP ${response.status} ${response.statusText} for ${url.pathname}.` +
+            (body ? ` Response: ${body}` : '')
+        );
       }
     }
-  },
-  {
-    name: 'get_street_level_outcomes',
-    description: 'Retrieve outcomes by lat/lng, custom polygon, or location ID',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        lat: { type: 'number', description: 'Latitude of the requested area' },
-        lng: { type: 'number', description: 'Longitude of the requested area' },
-        poly: { type: 'string', description: 'The lat/lng pairs defining the boundary of the custom area' },
-        location_id: { type: 'number', description: 'The ID of the location' },
-        date: { type: 'string', description: 'Limit results to a specific month (YYYY-MM)' }
-      }
-    }
-  },
-  {
-    name: 'get_crimes_at_location',
-    description: 'Retrieve crimes at a specific location by ID or nearest to lat/lng',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        lat: { type: 'number', description: 'Latitude of the requested crime area' },
-        lng: { type: 'number', description: 'Longitude of the requested crime area' },
-        location_id: { type: 'number', description: 'The ID of the location' },
-        date: { type: 'string', description: 'Limit results to a specific month (YYYY-MM)' }
-      }
-    }
-  },
-  {
-    name: 'get_crimes_no_location',
-    description: 'Retrieve crimes that could not be mapped to a location',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        category: { type: 'string', description: 'The category of the crimes' },
-        force: { type: 'string', description: 'Specific police force' },
-        date: { type: 'string', description: 'Limit results to a specific month (YYYY-MM)' }
-      },
-      required: ['category', 'force']
-    }
-  },
-  {
-    name: 'get_crime_categories',
-    description: 'Retrieve valid crime categories for a given date',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        date: { type: 'string', description: 'Specific month (YYYY-MM)' }
-      }
-    }
-  },
-  {
-    name: 'get_last_updated',
-    description: 'Retrieve the date when crime data was last updated',
-    inputSchema: {
-      type: 'object',
-      properties: {}
-    }
-  },
-  {
-    name: 'get_outcomes_for_crime',
-    description: 'Retrieve outcomes for a specific crime by persistent ID',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        persistent_id: { type: 'string', description: 'The 64-character unique identifier for the crime' }
-      },
-      required: ['persistent_id']
-    }
-  },
-  {
-    name: 'get_list_of_forces',
-    description: 'Retrieve a list of all police forces',
-    inputSchema: {
-      type: 'object',
-      properties: {}
-    }
-  },
-  {
-    name: 'get_force_details',
-    description: 'Retrieve details for a specific police force',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        force_id: { type: 'string', description: 'The unique identifier for the force' }
-      },
-      required: ['force_id']
-    }
-  },
-  {
-    name: 'get_senior_officers',
-    description: 'Retrieve senior officers for a specific police force',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        force_id: { type: 'string', description: 'The unique identifier for the force' }
-      },
-      required: ['force_id']
-    }
-  },
-  {
-    name: 'get_neighbourhoods',
-    description: 'Retrieve a list of neighbourhoods for a specific police force',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        force_id: { type: 'string', description: 'The unique identifier for the force' }
-      },
-      required: ['force_id']
-    }
-  },
-  {
-    name: 'get_neighbourhood_details',
-    description: 'Retrieve details for a specific neighbourhood within a force',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        force_id: { type: 'string', description: 'The unique identifier for the force' },
-        neighbourhood_id: { type: 'string', description: 'The unique identifier for the neighbourhood' }
-      },
-      required: ['force_id', 'neighbourhood_id']
-    }
-  },
-  {
-    name: 'get_neighbourhood_boundary',
-    description: 'Retrieve the boundary coordinates for a specific neighbourhood',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        force_id: { type: 'string', description: 'The unique identifier for the force' },
-        neighbourhood_id: { type: 'string', description: 'The unique identifier for the neighbourhood' }
-      },
-      required: ['force_id', 'neighbourhood_id']
-    }
-  },
-  {
-    name: 'get_neighbourhood_team',
-    description: 'Retrieve the team members for a specific neighbourhood',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        force_id: { type: 'string', description: 'The unique identifier for the force' },
-        neighbourhood_id: { type: 'string', description: 'The unique identifier for the neighbourhood' }
-      },
-      required: ['force_id', 'neighbourhood_id']
-    }
-  },
-  {
-    name: 'get_neighbourhood_events',
-    description: 'Retrieve events scheduled for a specific neighbourhood',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        force_id: { type: 'string', description: 'The unique identifier for the force' },
-        neighbourhood_id: { type: 'string', description: 'The unique identifier for the neighbourhood' }
-      },
-      required: ['force_id', 'neighbourhood_id']
-    }
-  },
-  {
-    name: 'get_neighbourhood_priorities',
-    description: 'Retrieve policing priorities for a specific neighbourhood',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        force_id: { type: 'string', description: 'The unique identifier for the force' },
-        neighbourhood_id: { type: 'string', description: 'The unique identifier for the neighbourhood' }
-      },
-      required: ['force_id', 'neighbourhood_id']
-    }
-  },
-  {
-    name: 'locate_neighbourhood',
-    description: 'Find the neighbourhood policing team for a given latitude and longitude',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        lat: { type: 'number', description: 'Latitude of the location' },
-        lng: { type: 'number', description: 'Longitude of the location' }
-      },
-      required: ['lat', 'lng']
-    }
-  },
-  {
-    name: 'get_stop_searches_by_area',
-    description: 'Retrieve stop and searches within a 1-mile radius or custom area',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        lat: { type: 'number', description: 'Latitude of the centre point' },
-        lng: { type: 'number', description: 'Longitude of the centre point' },
-        poly: { type: 'string', description: 'Lat/lng pairs defining a polygon' },
-        date: { type: 'string', description: 'Specific month (YYYY-MM)' }
-      }
-    }
-  },
-  {
-    name: 'get_stop_searches_by_location',
-    description: 'Retrieve stop and searches at a specific location by ID',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        location_id: { type: 'number', description: 'The ID of the location' },
-        date: { type: 'string', description: 'Specific month (YYYY-MM)' }
-      },
-      required: ['location_id']
-    }
-  },
-  {
-    name: 'get_stop_searches_no_location',
-    description: 'Retrieve stop and searches that could not be mapped to a location',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        force_id: { type: 'string', description: 'The unique identifier for the force' },
-        date: { type: 'string', description: 'Specific month (YYYY-MM)' }
-      },
-      required: ['force_id']
-    }
-  },
-  {
-    name: 'get_stop_searches_by_force',
-    description: 'Retrieve stop and searches reported by a specific force',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        force_id: { type: 'string', description: 'The unique identifier for the force' },
-        date: { type: 'string', description: 'Specific month (YYYY-MM)' }
-      },
-      required: ['force_id']
-    }
   }
-];
 
-// Tool implementation functions
-async function getStreetLevelCrimes(args: any) {
-  const { lat, lng, poly, date, category = 'all-crime' } = args;
-  const params: Record<string, any> = {};
-  
-  if (date) params.date = date;
-  if (lat && lng) {
-    params.lat = lat;
-    params.lng = lng;
-  } else if (poly) {
-    params.poly = poly;
-  } else {
-    return [];
+  return response.json();
+}
+
+/** URL-encode a single path segment (validated ids are still encoded defensively). */
+function enc(segment: string): string {
+  return encodeURIComponent(segment);
+}
+
+/**
+ * Serialize a tool result to text. Arrays longer than 1000 items are truncated
+ * with a note. Small results (<50 array items, or any object) are pretty-printed;
+ * larger results are compact to save tokens.
+ */
+function formatResult(result: unknown): string {
+  let value = result;
+  let note = '';
+  if (Array.isArray(result) && result.length > 1000) {
+    value = result.slice(0, 1000);
+    note = `\n...truncated 1000 of ${result.length} items`;
   }
-  
-  const endpoint = `crimes-street/${category}`;
-  return await makeApiRequest(endpoint, params) || [];
+  const isSmall = Array.isArray(value) ? value.length < 50 : true;
+  return JSON.stringify(value, null, isSmall ? 2 : 0) + note;
 }
 
-async function getStreetLevelOutcomes(args: any) {
-  const { lat, lng, poly, location_id, date } = args;
-  const params: Record<string, any> = {};
-  
-  if (date) params.date = date;
-  if (location_id) {
-    params.location_id = location_id;
-  } else if (lat && lng) {
-    params.lat = lat;
-    params.lng = lng;
-  } else if (poly) {
-    params.poly = poly;
-  } else {
-    return [];
-  }
-  
-  return await makeApiRequest('outcomes-at-location', params) || [];
+function textResult(result: unknown) {
+  return { content: [{ type: 'text' as const, text: formatResult(result) }] };
 }
 
-async function getCrimesAtLocation(args: any) {
-  const { lat, lng, location_id, date } = args;
-  const params: Record<string, any> = {};
-  
-  if (date) params.date = date;
-  if (location_id) {
-    params.location_id = location_id;
-  } else if (lat && lng) {
-    params.lat = lat;
-    params.lng = lng;
-  } else {
-    return [];
-  }
-  
-  return await makeApiRequest('crimes-at-location', params) || [];
-}
+// ---------------------------------------------------------------------------
+// Reusable validators
+// ---------------------------------------------------------------------------
 
-async function getCrimesNoLocation(args: any) {
-  const { category, force, date } = args;
-  const params: Record<string, any> = { category, force };
-  if (date) params.date = date;
-  return await makeApiRequest('crimes-no-location', params) || [];
-}
+const lat = z
+  .number()
+  .min(-90)
+  .max(90)
+  .describe('Latitude, between -90 and 90');
+const lng = z
+  .number()
+  .min(-180)
+  .max(180)
+  .describe('Longitude, between -180 and 180');
+const dateMonth = z
+  .string()
+  .regex(/^\d{4}-\d{2}$/, 'date must be in YYYY-MM format')
+  .describe('Limit results to a specific month, formatted as YYYY-MM');
+const forceId = z
+  .string()
+  .regex(/^[a-zA-Z0-9-]+$/, 'force id may only contain letters, digits and dashes')
+  .describe('Police force identifier, e.g. "metropolitan" or "avon-and-somerset"');
+const categoryId = z
+  .string()
+  .regex(/^[a-zA-Z0-9-]+$/, 'category may only contain letters, digits and dashes')
+  .describe('Crime category slug, e.g. "all-crime" or "burglary"');
+const neighbourhoodId = z
+  .string()
+  .regex(/^[a-zA-Z0-9_-]+$/, 'neighbourhood id may only contain letters, digits, dashes and underscores')
+  .describe('Neighbourhood identifier within the force');
+const persistentId = z
+  .string()
+  .regex(/^[a-fA-F0-9]{64}$/, 'persistent_id must be 64 hexadecimal characters')
+  .describe('The 64-character hexadecimal unique identifier for the crime');
+const poly = z
+  .string()
+  .describe('lat/lng pairs defining a polygon boundary, e.g. "52.2,0.1:52.3,0.2:52.1,0.15"');
+const locationId = z.number().int().describe('The numeric ID of an anonymised location');
 
-async function getCrimeCategories(args: any) {
-  const { date } = args;
-  const params = date ? { date } : {};
-  return await makeApiRequest('crime-categories', params) || [];
-}
+const READ_ONLY = { readOnlyHint: true, openWorldHint: true } as const;
 
-async function getLastUpdated() {
-  const data = await makeApiRequest('crime-last-updated');
-  return data?.date || '';
-}
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
 
-async function getOutcomesForCrime(args: any) {
-  const { persistent_id } = args;
-  const endpoint = `outcomes-for-crime/${persistent_id}`;
-  return await makeApiRequest(endpoint) || {};
-}
-
-async function getListOfForces() {
-  return await makeApiRequest('forces') || [];
-}
-
-async function getForceDetails(args: any) {
-  const { force_id } = args;
-  const endpoint = `forces/${force_id}`;
-  return await makeApiRequest(endpoint) || {};
-}
-
-async function getSeniorOfficers(args: any) {
-  const { force_id } = args;
-  const endpoint = `forces/${force_id}/people`;
-  return await makeApiRequest(endpoint) || [];
-}
-
-async function getNeighbourhoods(args: any) {
-  const { force_id } = args;
-  const endpoint = `${force_id}/neighbourhoods`;
-  return await makeApiRequest(endpoint) || [];
-}
-
-async function getNeighbourhoodDetails(args: any) {
-  const { force_id, neighbourhood_id } = args;
-  const endpoint = `${force_id}/${neighbourhood_id}`;
-  return await makeApiRequest(endpoint) || {};
-}
-
-async function getNeighbourhoodBoundary(args: any) {
-  const { force_id, neighbourhood_id } = args;
-  const endpoint = `${force_id}/${neighbourhood_id}/boundary`;
-  return await makeApiRequest(endpoint) || [];
-}
-
-async function getNeighbourhoodTeam(args: any) {
-  const { force_id, neighbourhood_id } = args;
-  const endpoint = `${force_id}/${neighbourhood_id}/people`;
-  return await makeApiRequest(endpoint) || [];
-}
-
-async function getNeighbourhoodEvents(args: any) {
-  const { force_id, neighbourhood_id } = args;
-  const endpoint = `${force_id}/${neighbourhood_id}/events`;
-  return await makeApiRequest(endpoint) || [];
-}
-
-async function getNeighbourhoodPriorities(args: any) {
-  const { force_id, neighbourhood_id } = args;
-  const endpoint = `${force_id}/${neighbourhood_id}/priorities`;
-  return await makeApiRequest(endpoint) || [];
-}
-
-async function locateNeighbourhood(args: any) {
-  const { lat, lng } = args;
-  const params = { q: `${lat},${lng}` };
-  return await makeApiRequest('locate-neighbourhood', params) || {};
-}
-
-async function getStopSearchesByArea(args: any) {
-  const { lat, lng, poly, date } = args;
-  const params: Record<string, any> = {};
-  
-  if (date) params.date = date;
-  if (lat !== undefined && lng !== undefined) {
-    params.lat = lat;
-    params.lng = lng;
-  } else if (poly) {
-    params.poly = poly;
-  } else {
-    return [];
-  }
-  
-  return await makeApiRequest('stops-street', params) || [];
-}
-
-async function getStopSearchesByLocation(args: any) {
-  const { location_id, date } = args;
-  const params: Record<string, any> = { location_id };
-  if (date) params.date = date;
-  return await makeApiRequest('stops-at-location', params) || [];
-}
-
-async function getStopSearchesNoLocation(args: any) {
-  const { force_id, date } = args;
-  const params: Record<string, any> = { force: force_id };
-  if (date) params.date = date;
-  return await makeApiRequest('stops-no-location', params) || [];
-}
-
-async function getStopSearchesByForce(args: any) {
-  const { force_id, date } = args;
-  const params: Record<string, any> = { force: force_id };
-  if (date) params.date = date;
-  return await makeApiRequest('stops-force', params) || [];
-}
-
-// Tool function mapping
-const toolFunctions = {
-  get_street_level_crimes: getStreetLevelCrimes,
-  get_street_level_outcomes: getStreetLevelOutcomes,
-  get_crimes_at_location: getCrimesAtLocation,
-  get_crimes_no_location: getCrimesNoLocation,
-  get_crime_categories: getCrimeCategories,
-  get_last_updated: getLastUpdated,
-  get_outcomes_for_crime: getOutcomesForCrime,
-  get_list_of_forces: getListOfForces,
-  get_force_details: getForceDetails,
-  get_senior_officers: getSeniorOfficers,
-  get_neighbourhoods: getNeighbourhoods,
-  get_neighbourhood_details: getNeighbourhoodDetails,
-  get_neighbourhood_boundary: getNeighbourhoodBoundary,
-  get_neighbourhood_team: getNeighbourhoodTeam,
-  get_neighbourhood_events: getNeighbourhoodEvents,
-  get_neighbourhood_priorities: getNeighbourhoodPriorities,
-  locate_neighbourhood: locateNeighbourhood,
-  get_stop_searches_by_area: getStopSearchesByArea,
-  get_stop_searches_by_location: getStopSearchesByLocation,
-  get_stop_searches_no_location: getStopSearchesNoLocation,
-  get_stop_searches_by_force: getStopSearchesByForce
-};
-
-// Create server
-const server = new Server({
+const server = new McpServer({
   name: 'police-uk-api-tools',
-  version: '1.0.0',
-  capabilities: {
-    tools: {}
-  }
+  version: '1.1.0',
 });
 
-// Handle tool listing
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return {
-    tools: tools
-  };
-});
-
-// Handle tool calls
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
-  
-  try {
-    const toolFunction = toolFunctions[name as keyof typeof toolFunctions];
-    if (!toolFunction) {
-      throw new Error(`Unknown tool: ${name}`);
+server.registerTool(
+  'get_street_level_crimes',
+  {
+    description:
+      'Retrieve street-level crimes at a point (lat/lng, 1-mile radius) or within a custom polygon area. Provide either lat AND lng, or poly.',
+    inputSchema: {
+      lat: lat.optional(),
+      lng: lng.optional(),
+      poly: poly.optional(),
+      date: dateMonth.optional(),
+      category: categoryId.default('all-crime'),
+    },
+    annotations: READ_ONLY,
+  },
+  async ({ lat, lng, poly, date, category }) => {
+    const query: Record<string, string | number | undefined> = { date };
+    if (lat !== undefined && lng !== undefined) {
+      query.lat = lat;
+      query.lng = lng;
+    } else if (poly !== undefined) {
+      query.poly = poly;
+    } else {
+      throw new Error('Provide either lat and lng, or poly, to locate the crimes.');
     }
-    
-    const result = await toolFunction(args);
-    return {
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify(result, null, 2)
-        }
-      ]
-    };
-  } catch (error) {
-    return {
-      content: [
-        {
-          type: 'text',
-          text: `Error: ${error instanceof Error ? error.message : String(error)}`
-        }
-      ],
-      isError: true
-    };
+    return textResult(await makeApiRequest(`crimes-street/${enc(category)}`, query));
   }
+);
+
+server.registerTool(
+  'get_street_level_outcomes',
+  {
+    description:
+      'Retrieve street-level outcomes by location ID, point (lat/lng), or custom polygon. Provide location_id, or lat AND lng, or poly.',
+    inputSchema: {
+      lat: lat.optional(),
+      lng: lng.optional(),
+      poly: poly.optional(),
+      location_id: locationId.optional(),
+      date: dateMonth.optional(),
+    },
+    annotations: READ_ONLY,
+  },
+  async ({ lat, lng, poly, location_id, date }) => {
+    const query: Record<string, string | number | undefined> = { date };
+    if (location_id !== undefined) {
+      query.location_id = location_id;
+    } else if (lat !== undefined && lng !== undefined) {
+      query.lat = lat;
+      query.lng = lng;
+    } else if (poly !== undefined) {
+      query.poly = poly;
+    } else {
+      throw new Error('Provide location_id, or lat and lng, or poly.');
+    }
+    return textResult(await makeApiRequest('outcomes-at-location', query));
+  }
+);
+
+server.registerTool(
+  'get_crimes_at_location',
+  {
+    description:
+      'Retrieve crimes at a specific anonymised location by ID, or at the location nearest to a point (lat/lng). Provide location_id, or lat AND lng.',
+    inputSchema: {
+      lat: lat.optional(),
+      lng: lng.optional(),
+      location_id: locationId.optional(),
+      date: dateMonth.optional(),
+    },
+    annotations: READ_ONLY,
+  },
+  async ({ lat, lng, location_id, date }) => {
+    const query: Record<string, string | number | undefined> = { date };
+    if (location_id !== undefined) {
+      query.location_id = location_id;
+    } else if (lat !== undefined && lng !== undefined) {
+      query.lat = lat;
+      query.lng = lng;
+    } else {
+      throw new Error('Provide location_id, or lat and lng.');
+    }
+    return textResult(await makeApiRequest('crimes-at-location', query));
+  }
+);
+
+server.registerTool(
+  'get_crimes_no_location',
+  {
+    description: 'Retrieve crimes for a force and category that could not be mapped to a location.',
+    inputSchema: {
+      category: categoryId.describe('Crime category slug, or "all-crime"'),
+      force: forceId,
+      date: dateMonth.optional(),
+    },
+    annotations: READ_ONLY,
+  },
+  async ({ category, force, date }) => {
+    return textResult(await makeApiRequest('crimes-no-location', { category, force, date }));
+  }
+);
+
+server.registerTool(
+  'get_crime_categories',
+  {
+    description: 'Retrieve the valid crime categories for a given month.',
+    inputSchema: { date: dateMonth.optional() },
+    annotations: READ_ONLY,
+  },
+  async ({ date }) => {
+    return textResult(await makeApiRequest('crime-categories', { date }));
+  }
+);
+
+server.registerTool(
+  'get_last_updated',
+  {
+    description: 'Retrieve the date when street-level crime data was last updated.',
+    inputSchema: {},
+    annotations: READ_ONLY,
+  },
+  async () => {
+    return textResult(await makeApiRequest('crime-last-updated'));
+  }
+);
+
+server.registerTool(
+  'get_outcomes_for_crime',
+  {
+    description: 'Retrieve the outcomes (case history) for a specific crime by its persistent ID.',
+    inputSchema: { persistent_id: persistentId },
+    annotations: READ_ONLY,
+  },
+  async ({ persistent_id }) => {
+    return textResult(await makeApiRequest(`outcomes-for-crime/${enc(persistent_id)}`));
+  }
+);
+
+server.registerTool(
+  'get_list_of_forces',
+  {
+    description: 'Retrieve a list of all police forces.',
+    inputSchema: {},
+    annotations: READ_ONLY,
+  },
+  async () => {
+    return textResult(await makeApiRequest('forces'));
+  }
+);
+
+server.registerTool(
+  'get_force_details',
+  {
+    description: 'Retrieve details for a specific police force.',
+    inputSchema: { force_id: forceId },
+    annotations: READ_ONLY,
+  },
+  async ({ force_id }) => {
+    return textResult(await makeApiRequest(`forces/${enc(force_id)}`));
+  }
+);
+
+server.registerTool(
+  'get_senior_officers',
+  {
+    description: 'Retrieve the senior officers for a specific police force.',
+    inputSchema: { force_id: forceId },
+    annotations: READ_ONLY,
+  },
+  async ({ force_id }) => {
+    return textResult(await makeApiRequest(`forces/${enc(force_id)}/people`));
+  }
+);
+
+server.registerTool(
+  'get_neighbourhoods',
+  {
+    description: 'Retrieve a list of neighbourhoods for a specific police force.',
+    inputSchema: { force_id: forceId },
+    annotations: READ_ONLY,
+  },
+  async ({ force_id }) => {
+    return textResult(await makeApiRequest(`${enc(force_id)}/neighbourhoods`));
+  }
+);
+
+server.registerTool(
+  'get_neighbourhood_details',
+  {
+    description: 'Retrieve details for a specific neighbourhood within a force.',
+    inputSchema: { force_id: forceId, neighbourhood_id: neighbourhoodId },
+    annotations: READ_ONLY,
+  },
+  async ({ force_id, neighbourhood_id }) => {
+    return textResult(await makeApiRequest(`${enc(force_id)}/${enc(neighbourhood_id)}`));
+  }
+);
+
+server.registerTool(
+  'get_neighbourhood_boundary',
+  {
+    description:
+      'Retrieve the boundary (list of lat/lng coordinates) for a specific neighbourhood. Can be large.',
+    inputSchema: { force_id: forceId, neighbourhood_id: neighbourhoodId },
+    annotations: READ_ONLY,
+  },
+  async ({ force_id, neighbourhood_id }) => {
+    return textResult(await makeApiRequest(`${enc(force_id)}/${enc(neighbourhood_id)}/boundary`));
+  }
+);
+
+server.registerTool(
+  'get_neighbourhood_team',
+  {
+    description: 'Retrieve the team members for a specific neighbourhood.',
+    inputSchema: { force_id: forceId, neighbourhood_id: neighbourhoodId },
+    annotations: READ_ONLY,
+  },
+  async ({ force_id, neighbourhood_id }) => {
+    return textResult(await makeApiRequest(`${enc(force_id)}/${enc(neighbourhood_id)}/people`));
+  }
+);
+
+server.registerTool(
+  'get_neighbourhood_events',
+  {
+    description: 'Retrieve events scheduled for a specific neighbourhood.',
+    inputSchema: { force_id: forceId, neighbourhood_id: neighbourhoodId },
+    annotations: READ_ONLY,
+  },
+  async ({ force_id, neighbourhood_id }) => {
+    return textResult(await makeApiRequest(`${enc(force_id)}/${enc(neighbourhood_id)}/events`));
+  }
+);
+
+server.registerTool(
+  'get_neighbourhood_priorities',
+  {
+    description: 'Retrieve policing priorities for a specific neighbourhood.',
+    inputSchema: { force_id: forceId, neighbourhood_id: neighbourhoodId },
+    annotations: READ_ONLY,
+  },
+  async ({ force_id, neighbourhood_id }) => {
+    return textResult(await makeApiRequest(`${enc(force_id)}/${enc(neighbourhood_id)}/priorities`));
+  }
+);
+
+server.registerTool(
+  'locate_neighbourhood',
+  {
+    description: 'Find the neighbourhood policing team responsible for a given latitude and longitude.',
+    inputSchema: { lat, lng },
+    annotations: READ_ONLY,
+  },
+  async ({ lat, lng }) => {
+    return textResult(await makeApiRequest('locate-neighbourhood', { q: `${lat},${lng}` }));
+  }
+);
+
+server.registerTool(
+  'get_stop_searches_by_area',
+  {
+    description:
+      'Retrieve stop-and-searches at a point (lat/lng, 1-mile radius) or within a custom polygon. Provide either lat AND lng, or poly.',
+    inputSchema: {
+      lat: lat.optional(),
+      lng: lng.optional(),
+      poly: poly.optional(),
+      date: dateMonth.optional(),
+    },
+    annotations: READ_ONLY,
+  },
+  async ({ lat, lng, poly, date }) => {
+    const query: Record<string, string | number | undefined> = { date };
+    if (lat !== undefined && lng !== undefined) {
+      query.lat = lat;
+      query.lng = lng;
+    } else if (poly !== undefined) {
+      query.poly = poly;
+    } else {
+      throw new Error('Provide either lat and lng, or poly.');
+    }
+    return textResult(await makeApiRequest('stops-street', query));
+  }
+);
+
+server.registerTool(
+  'get_stop_searches_by_location',
+  {
+    description: 'Retrieve stop-and-searches at a specific anonymised location by ID.',
+    inputSchema: { location_id: locationId, date: dateMonth.optional() },
+    annotations: READ_ONLY,
+  },
+  async ({ location_id, date }) => {
+    return textResult(await makeApiRequest('stops-at-location', { location_id, date }));
+  }
+);
+
+server.registerTool(
+  'get_stop_searches_no_location',
+  {
+    description: 'Retrieve stop-and-searches for a force that could not be mapped to a location.',
+    inputSchema: { force_id: forceId, date: dateMonth.optional() },
+    annotations: READ_ONLY,
+  },
+  async ({ force_id, date }) => {
+    return textResult(await makeApiRequest('stops-no-location', { force: force_id, date }));
+  }
+);
+
+server.registerTool(
+  'get_stop_searches_by_force',
+  {
+    description: 'Retrieve stop-and-searches reported by a specific force.',
+    inputSchema: { force_id: forceId, date: dateMonth.optional() },
+    annotations: READ_ONLY,
+  },
+  async ({ force_id, date }) => {
+    return textResult(await makeApiRequest('stops-force', { force: force_id, date }));
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Start
+// ---------------------------------------------------------------------------
+
+async function main() {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error('Police UK API MCP Server running on stdio');
+}
+
+main().catch((error) => {
+  console.error('Fatal error starting Police UK API MCP Server:', error);
+  process.exit(1);
 });
-
-// Start server
-const transport = new StdioServerTransport();
-server.connect(transport);
-
-console.error('Police UK API MCP Server running on stdio');
